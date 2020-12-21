@@ -3,9 +3,11 @@
 import re
 import sys
 import logging
+from typing import List, Iterable, Optional
 import argparse
 import itertools
 import subprocess
+from dataclasses import dataclass
 import multiprocessing as mp
 
 import yaml
@@ -18,85 +20,45 @@ REC_TIME = 30
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-class ChannelType:
-    def chdef(self, ch):
-        return {
-            'type': self.name(),
-            'ch_rec': self.format_recorder(ch),
-            'epgdump_mode': self.epgdump_mode(ch),
-        }
-
-    def name(self):
-        pass
-
-    def format_recorder(self, ch):
-        pass
-
-    def epgdump_mode(self, ch):
-        pass
-
-    def channels(self):
-        pass
-
-class GRChannel(ChannelType):
-    def name(self):
-        return 'GR'
-
-    def format_recorder(self, ch):
-        return "%d" % (ch, )
-
-    def epgdump_mode(self, ch):
-        return str(ch)
-
-    def channels(self):
-        return range(13, 53)
+@dataclass
+class ChannelTypeData:
+    name: str
+    channels: Iterable[int]
+    epgdump_mode: Optional[str]
+    recorder_ch_fmt: str
 
 
-class BSChannel(ChannelType):
-    def name(self):
-        return 'BS'
+@dataclass
+class GetEPGTask:
+    chtype: ChannelTypeData
 
-    def format_recorder(self, ch):
-        return "%s%d_%d" % ('BS', ch, 0)
-
-    def epgdump_mode(self, ch):
-        return '/BS'
-
-    def channels(self):
-        return range(1, 25, 2)
-
-class CSChannel(ChannelType):
-    def name(self):
-        return 'CS'
-
-    def format_recorder(self, ch):
-        return '%s%d' % ('CS', ch)
-
-    def epgdump_mode(self, ch):
-        return '/CS'
-
-    def channels(self):
-        return range(2, 25, 2)
-
-def get_epg_from_record(chdef):
-    logger.debug('EXEC: %s %s %d - | %s %s - -', chdef['recpt1'], chdef['ch_rec'], chdef['seconds'], chdef['epgdump'], chdef['epgdump_mode'])
-    p_recpt1 = subprocess.Popen([chdef['recpt1'], chdef['ch_rec'], str(chdef['seconds']), '-'],
+    ch_to_rec: str
+    epgdump_mode: str
+    
+    recpt1: str
+    epgdump: str
+    seconds: int
+    
+        
+def get_epg_from_record(task: GetEPGTask):
+    logger.debug('EXEC: %s %s %d - | %s %s - -', task.recpt1, task.ch_to_rec, task.seconds, task.epgdump, task.epgdump_mode)
+    p_recpt1 = subprocess.Popen([task.recpt1, task.ch_to_rec, str(task.seconds), '-'],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    p_epgdump = subprocess.Popen([chdef['epgdump'], chdef['epgdump_mode'], '-', '-'],
+    p_epgdump = subprocess.Popen([task.epgdump, task.epgdump_mode, '-', '-'],
                                  stdin=p_recpt1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     p_recpt1.stdout.close()
 
     root = etree.parse(p_epgdump.stdout)
     p_epgdump.wait()
-    return [xml_to_epg(chdef, channel) for channel in root.iter('channel')]
+    return [xml_to_epg(task, channel) for channel in root.iter('channel')]
 
-def xml_to_epg(chdef, channel):
+def xml_to_epg(task: GetEPGTask, channel):
     ch_spec = { 'tp': channel.attrib['tp'] }
     for item in channel.iterchildren():
         ch_spec[item.tag] = item.text
 
     ch = {
-        'type': chdef['type'],
+        'type': task.chtype.name,
         'name': ch_spec['display-name'],
         'channel': ch_spec['tp'],
         'serviceId': int(ch_spec['service_id']),
@@ -107,14 +69,12 @@ def xml_to_epg(chdef, channel):
     logger.info('[%s] %s: %s (sid %d)', ch['type'], ch['channel'], ch['name'], ch['serviceId'])
     return ch
 
-def get_epg_for_channel(chdef):
+def get_epg_for_channel(chdef: GetEPGTask):
     return get_epg_from_record(chdef)
 
-def mix_args(chdef, args):
-    chdef['recpt1'] = args.recpt1
-    chdef['epgdump'] = args.epgdump
-    chdef['seconds'] = args.seconds
-    return chdef
+def mix_args(chtype: ChannelTypeData, ch: int, args) -> GetEPGTask:
+    return GetEPGTask(chtype, chtype.recorder_ch_fmt.format(name=chtype.name, ch=ch),
+                      chtype.epgdump_mode if chtype.epgdump_mode else str(ch), args.recpt1, args.epgdump, args.seconds)
 
 def natsort_for_channel(i):
     def atoi(text):
@@ -123,16 +83,16 @@ def natsort_for_channel(i):
         return [atoi(c) for c in re.split(r'(\d+)', text)]
     return natural_keys(i['channel'])
 
-def get_epg_for_chtype_mp(pool, chtype, args):
-    channels = [mix_args(chtype.chdef(ch), args) for ch in chtype.channels()]
+def get_epg_for_chtype_mp(pool, chtype: ChannelTypeData, args):
+    channels: List[GetEPGTask] = [mix_args(chtype, ch, args) for ch in chtype.channels]
     result = [
         c for ch in pool.imap_unordered(get_epg_for_channel, channels, 4) if len(ch) > 0
         for c in ch if ch
     ]
-    return remove_duplicate_service(chtype.name(), result)
+    return remove_duplicate_service(chtype, result)
 
-def remove_duplicate_service(chtype, channels):
-    if chtype == 'GR':
+def remove_duplicate_service(chtype: ChannelTypeData, channels: List[GetEPGTask]):
+    if chtype.name == 'GR':
         return sorted(channels, key=natsort_for_channel)
 
     key_func = lambda i: i['serviceId']
@@ -160,10 +120,10 @@ if __name__ == '__main__':
     parser.add_argument('--epgdump', default=EPGDUMP, help='path to epgdump (default: %(default)s)')
     args = parser.parse_args()
 
-    chtypes = []
-    if args.gr: chtypes.append(GRChannel())
-    if args.bs: chtypes.append(BSChannel())
-    if args.cs: chtypes.append(CSChannel())
+    chtypes: List[ChannelTypeData] = []
+    if args.gr: chtypes.append(ChannelTypeData('GR', range(13, 53), None, "{ch:d}"))
+    if args.bs: chtypes.append(ChannelTypeData('BS', [1], '/BS', "{name:s}{ch:d}_0"))
+    if args.cs: chtypes.append(ChannelTypeData('CS', [2], '/CS', "{name:s}{ch:d}"))
 
     if len(chtypes) == 0:
         print("Nothing to do", file=sys.stderr)
